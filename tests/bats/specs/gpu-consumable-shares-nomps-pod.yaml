@@ -1,0 +1,41 @@
+# A pod whose claim shares a GPU without any sharing config, pinned to
+# __GPU_UUID__. It prints the GPU's compute mode, so it also shows whether MPS
+# teardown reset the GPU to Default.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: rct-cs-nomps
+  labels:
+    env: batssuite
+    test: cs-mps
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          selectors:
+          - cel:
+              expression: device.attributes["gpu.nvidia.com"].uuid == "__GPU_UUID__"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-cs-nomps
+  labels:
+    env: batssuite
+    test: cs-mps
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ctr
+    image: ubuntu:24.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi --query-gpu=compute_mode --format=csv,noheader; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: gpu
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: rct-cs-nomps
