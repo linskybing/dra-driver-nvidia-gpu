@@ -656,6 +656,14 @@ func (s *DeviceState) unpreparePartiallyPreparedClaim(ctx context.Context, cuid 
 		}
 	}
 
+	// A shared MPS control daemon started by the failed Prepare() would
+	// otherwise outlive all claims on its device.
+	if featuregates.Enabled(featuregates.MPSSupport) && isConsumableSharesEnabled(s.config) {
+		if err := s.stopUnusedSharedMpsControlDaemons(ctx, cuid, pc, checkpoint); err != nil {
+			return err
+		}
+	}
+
 	// If FM partitioning is enabled, then deactivate the partition
 	// for the devices in the claim. At this point, the gpuInfo objects
 	// for all devices in the claim are expected to have been discovered.
@@ -991,6 +999,14 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 		}
 	}
 
+	if featuregates.Enabled(featuregates.MPSSupport) && isConsumableSharesEnabled(s.config) {
+		// Each shared device has its own MPS control daemon, and a container
+		// can only reach one daemon (CDI keeps a single /tmp/nvidia-mps mount).
+		if n := len(mpsResults(configResultsMap)); n > 1 {
+			return nil, fmt.Errorf("claim %s has %d MPS allocation results, but MPS with consumable shares supports exactly one per claim", ResourceClaimToString(claim), n)
+		}
+	}
+
 	if s.fabricManagerPartitioningEnabled() {
 		if err := s.activateFabricPartition(claim); err != nil {
 			return nil, err
@@ -1179,8 +1195,15 @@ func (s *DeviceState) unprepareDevices(ctx context.Context, claimUID string, dev
 
 		// Stop any MPS control daemons started for each group of prepared devices.
 		if featuregates.Enabled(featuregates.MPSSupport) {
-			mpsControlDaemon := s.mpsManager.NewMpsControlDaemon(claimUID, group)
-			if err := mpsControlDaemon.Stop(ctx); err != nil {
+			// Groups without MPS store no ID; their recomputed per-claim ID
+			// has no daemon, so they cannot stop a daemon shared by others.
+			id := group.ConfigState.MpsControlDaemonID
+			if id == "" {
+				id = s.mpsManager.GetMpsControlDaemonID(claimUID, group)
+			}
+			if isConsumableSharesEnabled(s.config) && isPreparedDeviceInUseByOtherClaims(checkpoint, claimUID, group.Devices) {
+				klog.V(4).Infof("Unprepare: devices %v still in use by other claims, skipping stop of MPS control daemon '%s'", group.Devices.UUIDs(), id)
+			} else if err := s.mpsManager.NewMpsControlDaemon(id, group).Stop(ctx); err != nil {
 				return fmt.Errorf("error stopping MPS control daemon: %w", err)
 			}
 		}
@@ -1340,9 +1363,6 @@ func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.S
 
 	// Apply MPS settings (if available and feature gate enabled).
 	if featuregates.Enabled(featuregates.MPSSupport) && config.IsMps() {
-		if isConsumableSharesEnabled(s.config) {
-			return nil, fmt.Errorf("MPS sharing is not supported when consumable shares is enabled")
-		}
 		if featuregates.Enabled(featuregates.DynamicMIG) {
 			// TODO: create MIG device first, get its UUID, and then enable MPS
 			// for that device -- probably based on a `PreparedDevicesList`, and
@@ -1353,7 +1373,14 @@ func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.S
 		if err != nil {
 			return nil, fmt.Errorf("error getting MPS configuration: %w", err)
 		}
-		mpsControlDaemon := s.mpsManager.NewMpsControlDaemon(string(claim.UID), requestedDevices)
+		id := s.mpsManager.GetMpsControlDaemonID(string(claim.UID), requestedDevices)
+		if isConsumableSharesEnabled(s.config) {
+			// Claims sharing a device must share its daemon: two daemons
+			// cannot serve one GPU. prepareDevices() allows only one MPS
+			// device per claim in this mode.
+			id = s.mpsManager.SharedMpsControlDaemonID(requestedDevices.UUIDs()[0])
+		}
+		mpsControlDaemon := s.mpsManager.NewMpsControlDaemon(id, requestedDevices)
 		if err := mpsControlDaemon.Start(ctx, mpsc); err != nil {
 			return nil, fmt.Errorf("error starting MPS control daemon: %w", err)
 		}
@@ -1736,6 +1763,84 @@ func (s *DeviceState) getConfigResultsMap(allocation *resourceapi.AllocationResu
 	}
 
 	return configResultsMap, nil
+}
+
+// mpsResults returns the allocation results whose config selects MPS sharing.
+func mpsResults(configResultsMap map[runtime.Object][]*resourceapi.DeviceRequestAllocationResult) []*resourceapi.DeviceRequestAllocationResult {
+	var mps []*resourceapi.DeviceRequestAllocationResult
+	for c, results := range configResultsMap {
+		var sharing configapi.Sharing
+		switch config := c.(type) {
+		case *configapi.GpuConfig:
+			sharing = config.Sharing
+		case *configapi.MigDeviceConfig:
+			sharing = config.Sharing
+		}
+		if sharing != nil && sharing.IsMps() {
+			mps = append(mps, results...)
+		}
+	}
+	return mps
+}
+
+// stopUnusedSharedMpsControlDaemons stops the shared MPS control daemon of each
+// MPS device of a partially prepared claim, unless a prepared claim still uses
+// the device. Prepare() may have started the daemon before it failed.
+func (s *DeviceState) stopUnusedSharedMpsControlDaemons(ctx context.Context, claimUID string, pc PreparedClaim, checkpoint *Checkpoint) error {
+	configResultsMap, err := s.getConfigResultsMap(pc.Status.Allocation)
+	if err != nil {
+		// Don't block the claim's cleanup: the daemon is still stopped when
+		// the device's last prepared claim is unprepared.
+		klog.Warningf("Unprepare: cannot resolve MPS devices of partially prepared claim %s: %v", PreparedClaimToString(&pc, claimUID), err)
+		return nil
+	}
+
+	for _, r := range mpsResults(configResultsMap) {
+		device := s.perGPUAllocatable.GetAllocatableDevice(r.Device)
+		if device == nil {
+			continue
+		}
+		var inUse bool
+		switch device.Type() {
+		case GpuDeviceType:
+			inUse = isGpuUUIDInUseByOtherClaims(checkpoint, claimUID, device.Gpu.UUID)
+		case MigStaticDeviceType:
+			inUse = isMigDeviceInUseByOtherClaims(checkpoint, claimUID, device.MigStatic.UUID, r.Device)
+		default:
+			// MPS is not supported on other device types, so no daemon was started.
+			continue
+		}
+		if inUse {
+			continue
+		}
+		id := s.mpsManager.SharedMpsControlDaemonID(device.UUID())
+		if err := s.mpsManager.NewMpsControlDaemon(id, AllocatableDevices{r.Device: device}).Stop(ctx); err != nil {
+			return fmt.Errorf("error stopping MPS control daemon for device %s: %w", r.Device, err)
+		}
+	}
+	return nil
+}
+
+// isPreparedDeviceInUseByOtherClaims reports whether another prepared claim
+// still uses any of the given full GPUs or MIG devices.
+func isPreparedDeviceInUseByOtherClaims(checkpoint *Checkpoint, claimUID string, devices PreparedDeviceList) bool {
+	for _, d := range devices {
+		switch d.Type() {
+		case GpuDeviceType:
+			if d.Gpu.Info != nil && isGpuUUIDInUseByOtherClaims(checkpoint, claimUID, d.Gpu.Info.UUID) {
+				return true
+			}
+		case PreparedMigDeviceType:
+			var migUUID string
+			if d.Mig.Concrete != nil {
+				migUUID = d.Mig.Concrete.MigUUID
+			}
+			if d.Mig.Device != nil && isMigDeviceInUseByOtherClaims(checkpoint, claimUID, migUUID, d.Mig.Device.DeviceName) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func getDeviceConfigsWithDefaults(rawConfigs []resourceapi.DeviceAllocationConfiguration) ([]*OpaqueDeviceConfig, error) {

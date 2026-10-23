@@ -78,13 +78,39 @@ bats::on_failure() {
 }
 
 # bats test_tags=fastfeedback,gpu-sharing,consumable-shares
-@test "GPUs: ConsumableShares — MPS request fails when consumable shares enabled" {
-  local _specpath="tests/bats/specs/gpu-mps.yaml"
+@test "GPUs: ConsumableShares — 2 MPS pods share one MPS control daemon" {
+  if [ "${MOCK_NVML:-}" = "true" ]; then skip "requires real MPS daemon"; fi
+  local _specpath="tests/bats/specs/gpu-consumable-shares-mps.yaml"
 
   kubectl apply -f "${_specpath}"
-  # Pod should fail to reach READY because driver rejects MPS under consumable shares
-  run kubectl wait --for=condition=READY pods "pod-mps" --timeout=15s
-  [ "$status" -ne 0 ]
+  kubectl wait --for=condition=READY pods "pod-share-mps-0" --timeout=60s
+  kubectl wait --for=condition=READY pods "pod-share-mps-1" --timeout=60s
 
-  kubectl delete --ignore-not-found -f "${_specpath}"
+  run kubectl logs "pod-share-mps-0" -c ctr
+  assert_output --partial "UUID: GPU-"
+  local uid0
+  uid0=$(grep -o "UUID: GPU-[^)]*" <<< "${output}")
+
+  run kubectl logs "pod-share-mps-1" -c ctr
+  assert_output --partial "UUID: GPU-"
+  local uid1
+  uid1=$(grep -o "UUID: GPU-[^)]*" <<< "${output}")
+
+  assert_equal "$uid0" "$uid1"
+
+  # Both claims are served by one daemon for the shared GPU.
+  local _ns _name
+  read -r _ns _name < <(kubectl get deployments -A --no-headers | awk '/mps-control-daemon-shared-/ {print $1, $2}')
+  [ -n "${_name}" ]
+  assert_equal "$(kubectl get deployments -A --no-headers | grep -c "mps-control-daemon-shared-")" "1"
+
+  # The daemon outlives a claim while another claim still uses the GPU.
+  kubectl delete pod "pod-share-mps-0"
+  kubectl wait --for=delete pods "pod-share-mps-0" --timeout=30s
+  kubectl get deployment -n "${_ns}" "${_name}"
+
+  # It is stopped with the last claim.
+  kubectl delete -f "${_specpath}"
+  kubectl wait --for=delete pods "pod-share-mps-1" --timeout=30s
+  kubectl wait --for=delete -n "${_ns}" "deployment/${_name}" --timeout=60s
 }

@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -26,6 +27,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
@@ -153,7 +155,7 @@ func TestMpsControlDaemonStartWithExistingDeployment(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			devices := AllocatableDevices{"gpu-0": &AllocatableDevice{Gpu: &GpuInfo{UUID: "GPU-0"}}}
 			manager := newTestMpsManager(t)
-			daemon := manager.NewMpsControlDaemon("claim-uid", devices)
+			daemon := manager.NewMpsControlDaemon("test-daemon", devices)
 
 			deployment := newTestMpsDeployment(daemon.namespace, daemon.name, "node-a")
 			deployment.Annotations = tc.annotations
@@ -197,4 +199,19 @@ func TestDeleteNodeControlDaemons(t *testing.T) {
 		"dra-driver/dra-driver-controller",
 		"other/mps-control-daemon-c",
 	}, remaining)
+}
+
+func TestSharedMpsControlDaemonID(t *testing.T) {
+	nodeA := newTestMpsManager(t)
+	nodeB := newTestMpsManager(t)
+	nodeB.config.flags.nodeName = "node-b"
+
+	id := nodeA.SharedMpsControlDaemonID("GPU-0")
+	require.Equal(t, id, nodeA.SharedMpsControlDaemonID("GPU-0"), "all claims on a device must find the same daemon")
+	require.NotEqual(t, id, nodeA.SharedMpsControlDaemonID("GPU-1"))
+	require.NotEqual(t, id, nodeB.SharedMpsControlDaemonID("GPU-0"))
+	require.NotEqual(t, id, nodeA.SharedMpsControlDaemonID("MIG-GPU-0/1/0"))
+
+	// The ID ends up in Deployment names and label values.
+	require.Empty(t, validation.IsDNS1123Label(fmt.Sprintf(MpsControlDaemonNameFmt, nodeA.SharedMpsControlDaemonID("MIG-GPU-0/1/0"))))
 }
