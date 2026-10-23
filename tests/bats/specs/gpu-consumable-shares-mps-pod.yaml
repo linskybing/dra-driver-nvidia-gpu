@@ -1,0 +1,75 @@
+# One MPS pod with its own claim, pinned to one GPU. Rendered by
+# test_gpu_consumable_shares.bats with sed; placeholders:
+#   __NAME__      pod and ResourceClaimTemplate name
+#   __GPU_UUID__  GPU the claim must land on
+#   __SHARES__    consumed shares (of --consumable-shares=4)
+#   __MEMORY__    consumed memory, e.g. 2Gi
+#   __IMAGE__     container image (CUDA devel for probe, PyTorch for matmul)
+#   __MODE__      "sleep" (stay Running), "probe" or "matmul" (run, then exit)
+#   __ARGS__      program arguments, see gpu-consumable-shares-mps-probe-src.yaml
+# Requires the cs-mps-probe-src ConfigMap.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: __NAME__
+  labels:
+    env: batssuite
+    test: cs-mps
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          selectors:
+          - cel:
+              expression: device.attributes["gpu.nvidia.com"].uuid == "__GPU_UUID__"
+          capacity:
+            requests:
+              shares: __SHARES__
+              memory: __MEMORY__
+      config:
+      - requests: ["gpu"]
+        opaque:
+          driver: gpu.nvidia.com
+          parameters:
+            apiVersion: resource.nvidia.com/v1beta1
+            kind: GpuConfig
+            sharing:
+              strategy: MPS
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __NAME__
+  labels:
+    env: batssuite
+    test: cs-mps
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ctr
+    image: __IMAGE__
+    command: ["bash", "-c"]
+    args:
+    - |
+      set -e
+      nvidia-smi -L
+      if [ "__MODE__" = sleep ]; then trap 'exit 0' TERM; sleep 9999 & wait; exit 0; fi
+      if [ "__MODE__" = matmul ]; then exec python /src/matmul.py __ARGS__; fi
+      nvcc -o /tmp/probe /src/probe.cu
+      /tmp/probe __ARGS__
+    resources:
+      claims:
+      - name: gpu
+    volumeMounts:
+    - name: src
+      mountPath: /src
+  volumes:
+  - name: src
+    configMap:
+      name: cs-mps-probe-src
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: __NAME__

@@ -232,7 +232,8 @@ tests-gpu-single: runner-image
 		tests/bats/test_gpu_dynmig.bats \
 		tests/bats/test_gpu_sharing.bats \
 		tests/bats/test_gpu_robustness.bats \
-		tests/bats/test_gpu_extres.bats)
+		tests/bats/test_gpu_extres.bats \
+		tests/bats/test_gpu_consumable_shares.bats)
 
 # Stable single-GPU subset for pinned A10 Lambda CI. Derived from
 # tests-gpu-single, but excludes DynMIG.
@@ -264,7 +265,8 @@ tests-gpu: runner-image
 		tests/bats/test_gpu_dynmig.bats \
 		tests/bats/test_gpu_mig.bats \
 		tests/bats/test_gpu_updowngrade.bats \
-		tests/bats/test_gpu_stress.bats)
+		tests/bats/test_gpu_stress.bats \
+		tests/bats/test_gpu_consumable_shares.bats)
 
 # Run a subset covering mainly the CD plugin
 tests-cd: runner-image

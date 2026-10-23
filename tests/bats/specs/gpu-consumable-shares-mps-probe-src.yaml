@@ -1,0 +1,73 @@
+# Programs run by gpu-consumable-shares-mps-pod.yaml.
+#
+# probe.cu ("probe" mode, CUDA devel image): probe <MiB> [<MiB>...]
+#   prints SM_COUNT=<n>, then ALLOC_<MiB>MiB=OK|FAIL per size.
+#
+# matmul.py ("matmul" mode, PyTorch image):
+#   matmul.py <start-at-epoch> <seconds> <alloc-ok-MiB> <alloc-over-MiB>
+#   prints SM_COUNT=<n> and ALLOC_<MiB>MiB=OK|OOM for both sizes, waits until
+#   <start-at-epoch> so that concurrent pods overlap, then runs fp16 8192x8192
+#   matmuls for <seconds> and prints TFLOPS=<x> and MATMUL_DONE.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cs-mps-probe-src
+  labels:
+    env: batssuite
+data:
+  probe.cu: |
+    #include <cstdio>
+    #include <cstdlib>
+    #include <cuda_runtime.h>
+
+    int main(int argc, char **argv) {
+      cudaDeviceProp p;
+      if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) { printf("PROPS_FAIL\n"); return 1; }
+      printf("SM_COUNT=%d\n", p.multiProcessorCount);
+
+      for (int i = 1; i < argc; i++) {
+        size_t mib = strtoull(argv[i], NULL, 10);
+        void *buf = NULL;
+        cudaError_t err = cudaMalloc(&buf, mib << 20);
+        printf("ALLOC_%zuMiB=%s\n", mib, err == cudaSuccess ? "OK" : "FAIL");
+        if (err == cudaSuccess) cudaFree(buf);
+        cudaGetLastError();
+      }
+      printf("PROBE_DONE\n");
+      return 0;
+    }
+  matmul.py: |
+    import sys
+    import time
+
+    import torch
+
+    start_at, seconds = float(sys.argv[1]), float(sys.argv[2])
+    print(f"SM_COUNT={torch.cuda.get_device_properties(0).multi_processor_count}", flush=True)
+
+    for mib in (int(sys.argv[3]), int(sys.argv[4])):
+        try:
+            buf = torch.empty(mib << 20, dtype=torch.uint8, device="cuda")
+            result = "OK"
+            del buf
+        except torch.cuda.OutOfMemoryError:
+            result = "OOM"
+        torch.cuda.empty_cache()
+        print(f"ALLOC_{mib}MiB={result}", flush=True)
+
+    n = 8192
+    a = torch.randn(n, n, device="cuda", dtype=torch.float16)
+    b = torch.randn(n, n, device="cuda", dtype=torch.float16)
+    for _ in range(3):  # warm up cuBLAS
+        a @ b
+    torch.cuda.synchronize()
+
+    time.sleep(max(0.0, start_at - time.time()))
+    iters, t0 = 0, time.time()
+    while time.time() - t0 < seconds:
+        for _ in range(10):
+            a @ b
+        torch.cuda.synchronize()
+        iters += 10
+    print(f"TFLOPS={2 * n**3 * iters / (time.time() - t0) / 1e12:.2f}")
+    print("MATMUL_DONE", flush=True)

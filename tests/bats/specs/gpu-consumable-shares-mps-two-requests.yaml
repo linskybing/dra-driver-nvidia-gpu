@@ -1,0 +1,55 @@
+# One claim with two MPS requests. A container can reach only one MPS
+# daemon, so the kubelet plugin must refuse to prepare it.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: rct-cs-mps-two-requests
+  labels:
+    env: batssuite
+    test: cs-mps
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu0
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          capacity:
+            requests:
+              shares: 1
+      - name: gpu1
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          capacity:
+            requests:
+              shares: 1
+      config:
+      - requests: ["gpu0", "gpu1"]
+        opaque:
+          driver: gpu.nvidia.com
+          parameters:
+            apiVersion: resource.nvidia.com/v1beta1
+            kind: GpuConfig
+            sharing:
+              strategy: MPS
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-cs-mps-two-requests
+  labels:
+    env: batssuite
+    test: cs-mps
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ctr
+    image: ubuntu:24.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: gpus
+  resourceClaims:
+  - name: gpus
+    resourceClaimTemplateName: rct-cs-mps-two-requests
