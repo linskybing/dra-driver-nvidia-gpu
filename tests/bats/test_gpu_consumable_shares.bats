@@ -262,6 +262,34 @@ _sm_count() {
 }
 
 # bats test_tags=gpu-sharing,consumable-shares
+@test "GPUs: ConsumableShares — MPS limits hold for user-namespace pods with multiUser" {
+  if [ "${MOCK_NVML:-}" = "true" ]; then skip "requires real MPS daemon"; fi
+  # Nodes that run in containers (kind) cannot start user-namespace pods.
+  if [ "${TEST_SKIP_USERNS:-}" = "true" ]; then skip "user-namespace pods unsupported"; fi
+  local _spec="${BATS_TEST_TMPDIR}/userns.yaml"
+  sed "s/__GPU_UUID__/${TEST_CS_GPU_UUID}/g" tests/bats/specs/gpu-consumable-shares-mps-userns.yaml > "${_spec}"
+
+  # hostUsers: false maps the pods' root to an unprivileged host UID.
+  kubectl apply -f "${_spec}"
+  _wait_succeeded cs-mps-userns-1 cs-mps-userns-3
+
+  run kubectl logs cs-mps-userns-1 -c ctr
+  assert_output --partial "ALLOC_1024MiB=OK"
+  assert_output --partial "ALLOC_3072MiB=FAIL"
+  run kubectl logs cs-mps-userns-3 -c ctr
+  assert_output --partial "ALLOC_3072MiB=OK"
+
+  local sm1 sm3
+  sm1=$(_sm_count cs-mps-userns-1)
+  sm3=$(_sm_count cs-mps-userns-3)
+  echo "userns SM count: shares 1 -> ${sm1}, shares 3 -> ${sm3}"
+  [ "${sm1}" -lt "${sm3}" ]
+
+  kubectl delete -f "${_spec}" --timeout=120s
+  _assert_no_mps_leak
+}
+
+# bats test_tags=gpu-sharing,consumable-shares
 @test "GPUs: ConsumableShares — non-MPS claim waits until the GPU's MPS claims are gone" {
   if [ "${MOCK_NVML:-}" = "true" ]; then skip "requires real MPS daemon"; fi
   local _spec="${BATS_TEST_TMPDIR}/nomps.yaml"
