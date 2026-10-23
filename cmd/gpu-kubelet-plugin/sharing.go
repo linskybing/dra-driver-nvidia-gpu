@@ -33,6 +33,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -444,6 +445,31 @@ func (m *MpsControlDaemon) AssertReady(ctx context.Context) error {
 			return nil
 		},
 	)
+}
+
+// mpsClientLimitEdits turns the capacity that an allocation result consumes on
+// a shared device into MPS client limits, so that the quota the scheduler
+// accounts for also applies on the GPU. Client limits can only lower the
+// daemon's limits, and they apply to each process of the claim's containers.
+// sharesOption is the --consumable-shares value; only a share count publishes
+// "shares".
+func mpsClientLimitEdits(result *resourceapi.DeviceRequestAllocationResult, uuid string, sharesOption string) (*cdiapi.ContainerEdits, error) {
+	var env []string
+
+	if memory, ok := result.ConsumedCapacity["memory"]; ok && memory.Sign() > 0 {
+		limits, err := configapi.MpsPerDevicePinnedMemoryLimit{uuid: memory}.Normalize([]string{uuid}, nil)
+		if err != nil {
+			return nil, fmt.Errorf("invalid consumed memory %s: %w", memory.String(), err)
+		}
+		env = append(env, fmt.Sprintf("CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=%s=%s", uuid, limits[uuid]))
+	}
+
+	totalShares, err := strconv.ParseInt(strings.TrimSpace(sharesOption), 10, 64)
+	if shares, ok := result.ConsumedCapacity["shares"]; ok && shares.Sign() > 0 && err == nil && totalShares > 0 {
+		env = append(env, fmt.Sprintf("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=%d", max(1, shares.Value()*100/totalShares)))
+	}
+
+	return &cdiapi.ContainerEdits{ContainerEdits: &cdispec.ContainerEdits{Env: env}}, nil
 }
 
 func (m *MpsControlDaemon) GetCDIContainerEdits() *cdiapi.ContainerEdits {

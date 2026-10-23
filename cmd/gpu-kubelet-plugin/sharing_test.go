@@ -26,6 +26,8 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
@@ -214,4 +216,69 @@ func TestSharedMpsControlDaemonID(t *testing.T) {
 
 	// The ID ends up in Deployment names and label values.
 	require.Empty(t, validation.IsDNS1123Label(fmt.Sprintf(MpsControlDaemonNameFmt, nodeA.SharedMpsControlDaemonID("MIG-GPU-0/1/0"))))
+}
+
+func TestMpsClientLimitEdits(t *testing.T) {
+	testCases := map[string]struct {
+		uuid         string
+		consumed     map[resourceapi.QualifiedName]resource.Quantity
+		sharesOption string
+		expectedEnv  []string
+		expectedErr  string
+	}{
+		"memory and shares": {
+			uuid:         "GPU-0",
+			consumed:     map[resourceapi.QualifiedName]resource.Quantity{"memory": resource.MustParse("4Gi"), "shares": resource.MustParse("1")},
+			sharesOption: "4",
+			expectedEnv:  []string{"CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=GPU-0=4096M", "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25"},
+		},
+		"thread percentage rounds down": {
+			uuid:         "GPU-0",
+			consumed:     map[resourceapi.QualifiedName]resource.Quantity{"memory": resource.MustParse("0"), "shares": resource.MustParse("3")},
+			sharesOption: "8",
+			expectedEnv:  []string{"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=37"},
+		},
+		"thread percentage is at least 1": {
+			uuid:         "GPU-0",
+			consumed:     map[resourceapi.QualifiedName]resource.Quantity{"shares": resource.MustParse("1")},
+			sharesOption: "1000",
+			expectedEnv:  []string{"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=1"},
+		},
+		"unlimited mode default consumes nothing": {
+			uuid:         "GPU-0",
+			consumed:     map[resourceapi.QualifiedName]resource.Quantity{"memory": resource.MustParse("0")},
+			sharesOption: "unlimited",
+		},
+		"memory mode sets no thread percentage": {
+			uuid:         "GPU-0",
+			consumed:     map[resourceapi.QualifiedName]resource.Quantity{"memory": resource.MustParse("16Gi")},
+			sharesOption: "memory",
+			expectedEnv:  []string{"CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=GPU-0=16384M"},
+		},
+		"MIG device": {
+			uuid:         "MIG-0",
+			consumed:     map[resourceapi.QualifiedName]resource.Quantity{"memory": resource.MustParse("5Gi"), "shares": resource.MustParse("2")},
+			sharesOption: "4",
+			expectedEnv:  []string{"CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=MIG-0=5120M", "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=50"},
+		},
+		"memory below 1Mi is rejected": {
+			uuid:         "GPU-0",
+			consumed:     map[resourceapi.QualifiedName]resource.Quantity{"memory": resource.MustParse("512Ki")},
+			sharesOption: "memory",
+			expectedErr:  "invalid consumed memory",
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			result := &resourceapi.DeviceRequestAllocationResult{ConsumedCapacity: tc.consumed}
+			edits, err := mpsClientLimitEdits(result, tc.uuid, tc.sharesOption)
+			if tc.expectedErr != "" {
+				require.ErrorContains(t, err, tc.expectedErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedEnv, edits.Env)
+		})
+	}
 }

@@ -86,13 +86,18 @@ bats::on_failure() {
   kubectl wait --for=condition=READY pods "pod-share-mps-0" --timeout=60s
   kubectl wait --for=condition=READY pods "pod-share-mps-1" --timeout=60s
 
+  # Each claim's consumed capacity becomes its MPS client limits.
   run kubectl logs "pod-share-mps-0" -c ctr
   assert_output --partial "UUID: GPU-"
+  assert_output --partial "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25"
+  assert_output --regexp "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=GPU-[^=]+=1024M"
   local uid0
   uid0=$(grep -o "UUID: GPU-[^)]*" <<< "${output}")
 
   run kubectl logs "pod-share-mps-1" -c ctr
   assert_output --partial "UUID: GPU-"
+  assert_output --partial "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=75"
+  assert_output --regexp "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=GPU-[^=]+=2048M"
   local uid1
   uid1=$(grep -o "UUID: GPU-[^)]*" <<< "${output}")
 

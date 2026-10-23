@@ -1374,11 +1374,17 @@ func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.S
 			return nil, fmt.Errorf("error getting MPS configuration: %w", err)
 		}
 		id := s.mpsManager.GetMpsControlDaemonID(string(claim.UID), requestedDevices)
+		var limitEdits *cdiapi.ContainerEdits
 		if isConsumableSharesEnabled(s.config) {
 			// Claims sharing a device must share its daemon: two daemons
 			// cannot serve one GPU. prepareDevices() allows only one MPS
 			// device per claim in this mode.
-			id = s.mpsManager.SharedMpsControlDaemonID(requestedDevices.UUIDs()[0])
+			uuid := requestedDevices.UUIDs()[0]
+			id = s.mpsManager.SharedMpsControlDaemonID(uuid)
+			limitEdits, err = mpsClientLimitEdits(results[0], uuid, s.config.flags.consumableShares)
+			if err != nil {
+				return nil, fmt.Errorf("error converting consumed capacity into MPS client limits: %w", err)
+			}
 		}
 		mpsControlDaemon := s.mpsManager.NewMpsControlDaemon(id, requestedDevices)
 		if err := mpsControlDaemon.Start(ctx, mpsc); err != nil {
@@ -1388,7 +1394,7 @@ func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.S
 			return nil, fmt.Errorf("MPS control daemon is not yet ready: %w", err)
 		}
 		configState.MpsControlDaemonID = mpsControlDaemon.GetID()
-		configState.containerEdits = mpsControlDaemon.GetCDIContainerEdits()
+		configState.containerEdits = mpsControlDaemon.GetCDIContainerEdits().Append(limitEdits)
 	}
 
 	return &configState, nil
