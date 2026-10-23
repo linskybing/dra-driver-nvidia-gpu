@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
@@ -153,6 +154,10 @@ func TestMpsControlDaemonStartWithExistingDeployment(t *testing.T) {
 		},
 	}
 
+	// The fake terminating Deployment is never deleted.
+	defer func(d time.Duration) { mpsDaemonDeletionTimeout = d }(mpsDaemonDeletionTimeout)
+	mpsDaemonDeletionTimeout = 100 * time.Millisecond
+
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			devices := AllocatableDevices{"gpu-0": &AllocatableDevice{Gpu: &GpuInfo{UUID: "GPU-0"}}}
@@ -176,6 +181,22 @@ func TestMpsControlDaemonStartWithExistingDeployment(t *testing.T) {
 			require.ErrorContains(t, err, tc.expectedErr)
 		})
 	}
+}
+
+func TestMpsControlDaemonWaitForDeploymentDeleted(t *testing.T) {
+	devices := AllocatableDevices{"gpu-0": &AllocatableDevice{Gpu: &GpuInfo{UUID: "GPU-0"}}}
+	manager := newTestMpsManager(t)
+	daemon := manager.NewMpsControlDaemon("test-daemon", devices)
+	deployments := manager.config.clientsets.Core.AppsV1().Deployments(daemon.namespace)
+	_, err := deployments.Create(context.Background(), newTestMpsDeployment(daemon.namespace, daemon.name, "node-a"), metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = deployments.Delete(context.Background(), daemon.name, metav1.DeleteOptions{})
+	}()
+
+	require.NoError(t, daemon.waitForDeploymentDeleted(context.Background()))
 }
 
 func TestDeleteNodeControlDaemons(t *testing.T) {
