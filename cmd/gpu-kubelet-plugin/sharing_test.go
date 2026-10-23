@@ -17,12 +17,20 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
+
+	configapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
+	pkgflags "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/flags"
 )
 
 // mockFileChecker implements fileChecker for tests.
@@ -90,4 +98,103 @@ func TestRenderMpsControlDaemonDeploymentImagePullSettings(t *testing.T) {
 	}, deployment.Spec.Template.Spec.ImagePullSecrets)
 	require.Len(t, deployment.Spec.Template.Spec.Containers, 1)
 	require.Equal(t, corev1.PullAlways, deployment.Spec.Template.Spec.Containers[0].ImagePullPolicy)
+}
+
+func newTestMpsManager(t *testing.T, deployments ...*appsv1.Deployment) *MpsManager {
+	clientset := k8sfake.NewSimpleClientset()
+	for _, d := range deployments {
+		_, err := clientset.AppsV1().Deployments(d.Namespace).Create(context.Background(), d, metav1.CreateOptions{})
+		require.NoError(t, err)
+	}
+	cfg := &Config{
+		flags:      &Flags{nodeName: "node-a", namespace: "dra-driver"},
+		clientsets: pkgflags.ClientSets{Core: clientset},
+	}
+	return NewMpsManager(cfg, nil, "/", MpsControlDaemonTemplatePath)
+}
+
+func newTestMpsDeployment(namespace, name, nodeName string) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{NodeName: nodeName}},
+		},
+	}
+}
+
+func TestMpsControlDaemonStartWithExistingDeployment(t *testing.T) {
+	config := &configapi.MpsConfig{DefaultActiveThreadPercentage: ptr.To(50)}
+	configHash, err := mpsConfigHash(config)
+	require.NoError(t, err)
+	otherHash, err := mpsConfigHash(&configapi.MpsConfig{DefaultActiveThreadPercentage: ptr.To(25)})
+	require.NoError(t, err)
+
+	testCases := map[string]struct {
+		annotations map[string]string
+		terminating bool
+		expectedErr string
+	}{
+		"same config is reused": {
+			annotations: map[string]string{MpsConfigHashAnnotation: configHash},
+		},
+		"daemon without config hash is reused": {},
+		"different config is rejected": {
+			annotations: map[string]string{MpsConfigHashAnnotation: otherHash},
+			expectedErr: "different MPS configuration",
+		},
+		"terminating daemon is rejected": {
+			annotations: map[string]string{MpsConfigHashAnnotation: configHash},
+			terminating: true,
+			expectedErr: "is terminating",
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			devices := AllocatableDevices{"gpu-0": &AllocatableDevice{Gpu: &GpuInfo{UUID: "GPU-0"}}}
+			manager := newTestMpsManager(t)
+			daemon := manager.NewMpsControlDaemon("claim-uid", devices)
+
+			deployment := newTestMpsDeployment(daemon.namespace, daemon.name, "node-a")
+			deployment.Annotations = tc.annotations
+			if tc.terminating {
+				deployment.DeletionTimestamp = ptr.To(metav1.Now())
+			}
+			_, err := manager.config.clientsets.Core.AppsV1().Deployments(daemon.namespace).Create(context.Background(), deployment, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			// An existing daemon returns before any host-side setup, so this needs no GPU.
+			err = daemon.Start(context.Background(), config)
+			if tc.expectedErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.expectedErr)
+		})
+	}
+}
+
+func TestDeleteNodeControlDaemons(t *testing.T) {
+	manager := newTestMpsManager(t,
+		newTestMpsDeployment("dra-driver", "mps-control-daemon-a", "node-a"),
+		newTestMpsDeployment("dra-driver", "mps-control-daemon-b", "node-b"),
+		newTestMpsDeployment("dra-driver", "dra-driver-controller", "node-a"),
+		newTestMpsDeployment("other", "mps-control-daemon-c", "node-a"),
+	)
+
+	require.NoError(t, manager.DeleteNodeControlDaemons(context.Background()))
+
+	var remaining []string
+	for _, namespace := range []string{"dra-driver", "other"} {
+		list, err := manager.config.clientsets.Core.AppsV1().Deployments(namespace).List(context.Background(), metav1.ListOptions{})
+		require.NoError(t, err)
+		for _, d := range list.Items {
+			remaining = append(remaining, d.Namespace+"/"+d.Name)
+		}
+	}
+	require.ElementsMatch(t, []string{
+		"dra-driver/mps-control-daemon-b",
+		"dra-driver/dra-driver-controller",
+		"other/mps-control-daemon-c",
+	}, remaining)
 }

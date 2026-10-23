@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -55,6 +56,7 @@ const (
 	MpsControlDaemonTemplatePath = "/templates/mps-control-daemon.tmpl.yaml"
 	MpsControlDaemonNameFmt      = "mps-control-daemon-%v" // Fill with ClaimUID
 	MpsDefaultShmMountPath       = "/dev/shm"
+	MpsConfigHashAnnotation      = DriverName + "/mps-config-hash"
 
 	// driverRootMountDir is the directory where the driver root is mounted inside the kubelet plugin container.
 	driverRootMountDir = "/driver-root"
@@ -187,16 +189,38 @@ func (m *MpsManager) GetMpsControlDaemonID(claimUID string, devices UUIDProvider
 	return fmt.Sprintf("%s-%s", claimUID, hex.EncodeToString(hash[:])[:5])
 }
 
-func (m *MpsManager) IsControlDaemonStarted(ctx context.Context, id string) (bool, error) {
-	name := fmt.Sprintf(MpsControlDaemonNameFmt, id)
-	_, err := m.config.clientsets.Core.AppsV1().Deployments(m.config.flags.namespace).Get(ctx, name, metav1.GetOptions{})
-	if errors.IsNotFound(err) {
-		return false, nil
-	}
+// DeleteNodeControlDaemons deletes all MPS control daemons of this node. Call
+// it when the checkpoint is reset: no claim references these daemons anymore,
+// and after a reboot their host state (tmpfs mount, compute mode) is gone.
+func (m *MpsManager) DeleteNodeControlDaemons(ctx context.Context) error {
+	deployments, err := m.config.clientsets.Core.AppsV1().Deployments(m.config.flags.namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return false, fmt.Errorf("failed to get deployment: %w", err)
+		return fmt.Errorf("failed to list deployments: %w", err)
 	}
-	return true, nil
+
+	prefix := fmt.Sprintf(MpsControlDaemonNameFmt, "")
+	deletePolicy := metav1.DeletePropagationForeground
+	for _, d := range deployments.Items {
+		if !strings.HasPrefix(d.Name, prefix) || d.Spec.Template.Spec.NodeName != m.config.flags.nodeName {
+			continue
+		}
+		klog.Infof("Deleting stale MPS control daemon %s", d.Name)
+		err := m.config.clientsets.Core.AppsV1().Deployments(d.Namespace).Delete(ctx, d.Name, metav1.DeleteOptions{PropagationPolicy: &deletePolicy})
+		if err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete deployment %s: %w", d.Name, err)
+		}
+	}
+	return nil
+}
+
+// mpsConfigHash identifies the MPS settings a control daemon was started with.
+func mpsConfigHash(config *configapi.MpsConfig) (string, error) {
+	data, err := json.Marshal(config)
+	if err != nil {
+		return "", fmt.Errorf("error marshalling MPS config: %w", err)
+	}
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:]), nil
 }
 
 func (m *MpsManager) IsControlDaemonStopped(ctx context.Context, id string) (bool, error) {
@@ -216,12 +240,24 @@ func (m *MpsControlDaemon) GetID() string {
 }
 
 func (m *MpsControlDaemon) Start(ctx context.Context, config *configapi.MpsConfig) error {
-	isStarted, err := m.manager.IsControlDaemonStarted(ctx, m.id)
+	configHash, err := mpsConfigHash(config)
 	if err != nil {
-		return fmt.Errorf("error checking if control daemon already started: %w", err)
+		return err
 	}
 
-	if isStarted {
+	existing, err := m.manager.config.clientsets.Core.AppsV1().Deployments(m.namespace).Get(ctx, m.name, metav1.GetOptions{})
+	switch {
+	case errors.IsNotFound(err):
+	case err != nil:
+		return fmt.Errorf("failed to get deployment: %w", err)
+	case existing.DeletionTimestamp != nil:
+		// Stop() may already have removed its host directories; the kubelet
+		// retries the claim once the deletion is complete.
+		return fmt.Errorf("MPS control daemon %s is terminating", m.name)
+	case existing.Annotations[MpsConfigHashAnnotation] != "" && existing.Annotations[MpsConfigHashAnnotation] != configHash:
+		// Daemons created before this annotation existed carry no hash.
+		return fmt.Errorf("MPS control daemon %s is running with a different MPS configuration", m.name)
+	default:
 		return nil
 	}
 
@@ -275,6 +311,7 @@ func (m *MpsControlDaemon) Start(ctx context.Context, config *configapi.MpsConfi
 	if err != nil {
 		return err
 	}
+	metav1.SetMetaDataAnnotation(&deployment.ObjectMeta, MpsConfigHashAnnotation, configHash)
 
 	err = os.MkdirAll(m.shmDir, 0755)
 	if err != nil {

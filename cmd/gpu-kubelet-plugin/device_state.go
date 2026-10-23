@@ -279,6 +279,14 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		}
 	}
 
+	// Do this before writing the new checkpoint so that a failure is retried
+	// on the next plugin start.
+	if featuregates.Enabled(featuregates.MPSSupport) {
+		if err := mpsManager.DeleteNodeControlDaemons(ctx); err != nil {
+			return nil, fmt.Errorf("unable to delete stale MPS control daemons: %w", err)
+		}
+	}
+
 	klog.Infof("Create empty checkpoint")
 	newCheckpoint := &Checkpoint{V2: &CheckpointV2{NodeBootID: currentBootID}}
 	if err := state.createCheckpoint(ctx, newCheckpoint); err != nil {
