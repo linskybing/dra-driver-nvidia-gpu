@@ -242,6 +242,18 @@ func (m *MpsManager) IsControlDaemonStopped(ctx context.Context, id string) (boo
 	return false, nil
 }
 
+// mpsDaemonDeletionTimeout bounds how long Start() waits for a terminating
+// daemon; Prepare() calls are serialized, so other claims wait as well.
+var mpsDaemonDeletionTimeout = 30 * time.Second
+
+func (m *MpsControlDaemon) waitForDeploymentDeleted(ctx context.Context) error {
+	return wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, mpsDaemonDeletionTimeout, true, func(ctx context.Context) (bool, error) {
+		_, err := m.manager.config.clientsets.Core.AppsV1().Deployments(m.namespace).Get(ctx, m.name, metav1.GetOptions{})
+		// Keep polling through transient API errors until the timeout.
+		return errors.IsNotFound(err), nil
+	})
+}
+
 func (m *MpsControlDaemon) GetID() string {
 	return m.id
 }
@@ -258,9 +270,11 @@ func (m *MpsControlDaemon) Start(ctx context.Context, config *configapi.MpsConfi
 	case err != nil:
 		return fmt.Errorf("failed to get deployment: %w", err)
 	case existing.DeletionTimestamp != nil:
-		// Stop() may already have removed its host directories; the kubelet
-		// retries the claim once the deletion is complete.
-		return fmt.Errorf("MPS control daemon %s is terminating", m.name)
+		// The last claim on the device just stopped this daemon. Wait for it
+		// here: the kubelet would only retry the claim about a minute later.
+		if err := m.waitForDeploymentDeleted(ctx); err != nil {
+			return fmt.Errorf("MPS control daemon %s is terminating: %w", m.name, err)
+		}
 	case existing.Annotations[MpsConfigHashAnnotation] != "" && existing.Annotations[MpsConfigHashAnnotation] != configHash:
 		// Daemons created before this annotation existed carry no hash.
 		return fmt.Errorf("MPS control daemon %s is running with a different MPS configuration", m.name)
