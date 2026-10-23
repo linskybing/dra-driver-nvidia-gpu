@@ -93,6 +93,17 @@ RUN --mount=type=cache,target=/mc/go/build-cache,id=gocache \
     case "$TARGETARCH" in "$BUILDARCH") cc=gcc;; arm64) cc=aarch64-linux-gnu-gcc;; amd64) cc=x86_64-linux-gnu-gcc;; esac && \
     time make CC=${cc} GOARCH=${TARGETARCH} GO_MOD=${GO_MOD} PREFIX=/artifacts cmds
 
+# Build nvidia-cdi-hook from the toolkit version in go.mod with this Go
+# toolchain, so the shipped hook carries the same Go security fixes as the
+# driver binaries; the copy in the toolkit image can lag behind.
+RUN --mount=type=cache,target=/mc/go/build-cache,id=gocache \
+    --mount=type=cache,target=/mc/go/pkg/mod,id=gomodcache \
+    case "$TARGETARCH" in "$BUILDARCH") cc=gcc;; arm64) cc=aarch64-linux-gnu-gcc;; amd64) cc=x86_64-linux-gnu-gcc;; esac && \
+    toolkit=$(awk '$1 == "github.com/NVIDIA/nvidia-container-toolkit" {print $2; exit}' go.mod) && \
+    CC=${cc} CGO_ENABLED=1 GOARCH=${TARGETARCH} GOFLAGS=-mod=mod GOPATH=/tmp/cdi-hook \
+        go install github.com/NVIDIA/nvidia-container-toolkit/cmd/nvidia-cdi-hook@${toolkit} && \
+    cp "$(find /tmp/cdi-hook/bin -type f -name nvidia-cdi-hook)" /artifacts/nvidia-cdi-hook
+
 # Static bash binary, sourced from the Debian 'bash-static' package on
 # trixie. Replaces a from-source build that was flaky in CI (autoconf
 # availability, GNU mirror instability, cross-compile segfaults; see
@@ -104,10 +115,6 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends bash-static \
  && rm -rf /var/lib/apt/lists/* \
  && /bin/bash-static --version
-
-# Pull the nvidia-cdi-hook binary out of the relevant toolkit container
-# (arch: TARGETPLATFORM, set via --platform).
-FROM ${TOOLKIT_CONTAINER_IMAGE} AS toolkit
 
 # Construct production image (arch: TARGETPLATFORM, set via the `--platform` CLI
 # arg). gcr.io/distroless/cc:debug is distroless/cc plus busybox at /busybox/
@@ -138,7 +145,7 @@ COPY LICENSE /
 
 COPY --from=bash    /bin/bash-static                          /bin/bash
 
-COPY --from=toolkit /artifacts/rpm/usr/bin/nvidia-cdi-hook    /usr/bin/nvidia-cdi-hook
+COPY --from=build   /artifacts/nvidia-cdi-hook                /usr/bin/nvidia-cdi-hook
 COPY --from=build   /artifacts/compute-domain-controller      /usr/bin/compute-domain-controller
 COPY --from=build   /artifacts/compute-domain-kubelet-plugin  /usr/bin/compute-domain-kubelet-plugin
 COPY --from=build   /artifacts/compute-domain-daemon          /usr/bin/compute-domain-daemon
