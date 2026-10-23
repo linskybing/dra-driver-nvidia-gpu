@@ -54,7 +54,7 @@ import (
 const (
 	MpsControlFilesDirName       = "mps"
 	MpsControlDaemonTemplatePath = "/templates/mps-control-daemon.tmpl.yaml"
-	MpsControlDaemonNameFmt      = "mps-control-daemon-%v" // Fill with ClaimUID
+	MpsControlDaemonNameFmt      = "mps-control-daemon-%v" // Fill with the daemon ID
 	MpsDefaultShmMountPath       = "/dev/shm"
 	MpsConfigHashAnnotation      = DriverName + "/mps-config-hash"
 
@@ -166,9 +166,7 @@ func NewMpsManager(config *Config, deviceLib *deviceLib, hostDriverRoot, templat
 	}
 }
 
-func (m *MpsManager) NewMpsControlDaemon(claimUID string, devices UUIDProvider) *MpsControlDaemon {
-	id := m.GetMpsControlDaemonID(claimUID, devices)
-
+func (m *MpsManager) NewMpsControlDaemon(id string, devices UUIDProvider) *MpsControlDaemon {
 	return &MpsControlDaemon{
 		id:        id,
 		nodeName:  m.config.flags.nodeName,
@@ -187,6 +185,14 @@ func (m *MpsManager) GetMpsControlDaemonID(claimUID string, devices UUIDProvider
 	combined := strings.Join(devices.UUIDs(), ",")
 	hash := sha256.Sum256([]byte(combined))
 	return fmt.Sprintf("%s-%s", claimUID, hex.EncodeToString(hash[:])[:5])
+}
+
+// SharedMpsControlDaemonID returns the ID of the MPS control daemon that all
+// claims on one device share when consumable shares is enabled. It is
+// derived from the node and device only, so every claim finds the same daemon.
+func (m *MpsManager) SharedMpsControlDaemonID(deviceUUID string) string {
+	hash := sha256.Sum256([]byte(m.config.flags.nodeName + "/" + deviceUUID))
+	return "shared-" + hex.EncodeToString(hash[:])[:16]
 }
 
 // DeleteNodeControlDaemons deletes all MPS control daemons of this node. Call

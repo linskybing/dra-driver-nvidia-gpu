@@ -18,18 +18,22 @@ package main
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
 	configapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/fabricmanager"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
+	pkgflags "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/flags"
 )
 
 func TestValidateNoOverlappingPreparedDevices(t *testing.T) {
@@ -229,83 +233,286 @@ func TestGetAllocatableDevicesForClaim(t *testing.T) {
 	}
 }
 
-func TestApplySharingConfigMpsDisallowedWithConsumableShares(t *testing.T) {
-	perGPU := &PerGPUAllocatableDevices{
-		allocatablesMap: map[PCIBusID]AllocatableDevices{
-			"0000:00:00.0": {
-				"gpu-0": &AllocatableDevice{Gpu: &GpuInfo{UUID: "GPU-0000", cudaComputeCapability: "8.0"}},
-				"gpu-1": &AllocatableDevice{Gpu: &GpuInfo{UUID: "GPU-0001", cudaComputeCapability: "8.0"}},
+func setMpsWithConsumableSharesGates(t *testing.T) {
+	require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{
+		string(featuregates.MPSSupport):          true,
+		string(featuregates.ConsumableShares):    true,
+		string(featuregates.DynamicMIG):          false,
+		string(featuregates.PassthroughSupport):  false,
+		string(featuregates.TimeSlicingSettings): false,
+	}))
+}
+
+func newTestOpaqueConfig(kind string, sharing string, requests ...string) resourceapi.DeviceAllocationConfiguration {
+	parameters := `{"apiVersion":"resource.nvidia.com/v1beta1","kind":"` + kind + `"`
+	if sharing != "" {
+		parameters += `,"sharing":{"strategy":"` + sharing + `"}`
+	}
+	parameters += "}"
+	return resourceapi.DeviceAllocationConfiguration{
+		Source:   resourceapi.AllocationConfigSourceClaim,
+		Requests: requests,
+		DeviceConfiguration: resourceapi.DeviceConfiguration{
+			Opaque: &resourceapi.OpaqueDeviceConfiguration{
+				Driver:     DriverName,
+				Parameters: runtime.RawExtension{Raw: []byte(parameters)},
+			},
+		},
+	}
+}
+
+func TestPrepareDevicesMpsResultsWithConsumableShares(t *testing.T) {
+	setMpsWithConsumableSharesGates(t)
+
+	state := &DeviceState{
+		config: &Config{flags: &Flags{consumableShares: "4"}},
+		perGPUAllocatable: &PerGPUAllocatableDevices{
+			allocatablesMap: map[PCIBusID]AllocatableDevices{
+				"0000:00:00.0": {
+					"gpu-0": &AllocatableDevice{Gpu: &GpuInfo{UUID: "GPU-0"}},
+					"gpu-1": &AllocatableDevice{Gpu: &GpuInfo{UUID: "GPU-1"}},
+				},
 			},
 		},
 	}
 
-	config := &configapi.GpuSharing{
-		Strategy:  configapi.MpsStrategy,
-		MpsConfig: &configapi.MpsConfig{},
+	testCases := map[string]struct {
+		results []resourceapi.DeviceRequestAllocationResult
+		configs []resourceapi.DeviceAllocationConfiguration
+	}{
+		"one MPS group with two devices": {
+			results: []resourceapi.DeviceRequestAllocationResult{
+				{Driver: DriverName, Request: "req-0", Device: "gpu-0"},
+				{Driver: DriverName, Request: "req-0", Device: "gpu-1"},
+			},
+			configs: []resourceapi.DeviceAllocationConfiguration{newTestOpaqueConfig("GpuConfig", "MPS", "req-0")},
+		},
+		"two MPS groups": {
+			results: []resourceapi.DeviceRequestAllocationResult{
+				{Driver: DriverName, Request: "req-0", Device: "gpu-0"},
+				{Driver: DriverName, Request: "req-1", Device: "gpu-1"},
+			},
+			configs: []resourceapi.DeviceAllocationConfiguration{
+				newTestOpaqueConfig("GpuConfig", "MPS", "req-0"),
+				newTestOpaqueConfig("GpuConfig", "MPS", "req-1"),
+			},
+		},
+		"same device allocated twice": {
+			results: []resourceapi.DeviceRequestAllocationResult{
+				{Driver: DriverName, Request: "req-0", Device: "gpu-0"},
+				{Driver: DriverName, Request: "req-1", Device: "gpu-0"},
+			},
+			configs: []resourceapi.DeviceAllocationConfiguration{newTestOpaqueConfig("GpuConfig", "MPS")},
+		},
 	}
 
-	claim := &resourceapi.ResourceClaim{
-		ObjectMeta: metav1.ObjectMeta{UID: "test-claim-uid"},
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			claim := &resourceapi.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-uid"},
+				Status: resourceapi.ResourceClaimStatus{
+					Allocation: &resourceapi.AllocationResult{
+						Devices: resourceapi.DeviceAllocationResult{Results: tc.results, Config: tc.configs},
+					},
+				},
+			}
+			_, err := state.prepareDevices(context.Background(), claim, nil)
+			require.ErrorContains(t, err, "MPS with consumable shares supports exactly one per claim")
+		})
+	}
+}
+
+func TestMpsResults(t *testing.T) {
+	mps := &configapi.GpuConfig{Sharing: &configapi.GpuSharing{Strategy: configapi.MpsStrategy}}
+	timeSlicing := &configapi.GpuConfig{Sharing: &configapi.GpuSharing{Strategy: configapi.TimeSlicingStrategy}}
+	migMps := &configapi.MigDeviceConfig{Sharing: &configapi.MigDeviceSharing{Strategy: configapi.MpsStrategy}}
+
+	gpu0 := &resourceapi.DeviceRequestAllocationResult{Device: "gpu-0"}
+	gpu1 := &resourceapi.DeviceRequestAllocationResult{Device: "gpu-1"}
+	gpu2 := &resourceapi.DeviceRequestAllocationResult{Device: "gpu-2"}
+	gpu3 := &resourceapi.DeviceRequestAllocationResult{Device: "gpu-3"}
+	mig0 := &resourceapi.DeviceRequestAllocationResult{Device: "mig-0"}
+	vfio0 := &resourceapi.DeviceRequestAllocationResult{Device: "vfio-0"}
+
+	configResultsMap := map[runtime.Object][]*resourceapi.DeviceRequestAllocationResult{
+		mps:                                 {gpu0, gpu1},
+		timeSlicing:                         {gpu2},
+		configapi.DefaultGpuConfig():        {gpu3},
+		migMps:                              {mig0},
+		configapi.DefaultVfioDeviceConfig(): {vfio0},
 	}
 
-	results := []*resourceapi.DeviceRequestAllocationResult{
-		{Request: "req-0", Device: "gpu-0"},
-		{Request: "req-1", Device: "gpu-1"},
+	require.ElementsMatch(t,
+		[]*resourceapi.DeviceRequestAllocationResult{gpu0, gpu1, mig0},
+		mpsResults(configResultsMap))
+}
+
+func newTestMigClaim(migUUID, deviceName, mpsControlDaemonID string, state ClaimCheckpointState) PreparedClaim {
+	return PreparedClaim{
+		CheckpointState: state,
+		PreparedDevices: PreparedDevices{
+			{
+				Devices: PreparedDeviceList{
+					{
+						Mig: &PreparedMigDevice{
+							Concrete: &MigLiveTuple{MigUUID: migUUID},
+							Device:   &CheckpointedDevice{DeviceName: deviceName},
+						},
+					},
+				},
+				ConfigState: DeviceConfigState{MpsControlDaemonID: mpsControlDaemonID},
+			},
+		},
 	}
+}
 
-	t.Run("disallowed when consumable shares enabled", func(t *testing.T) {
-		require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{
-			string(featuregates.MPSSupport):       true,
-			string(featuregates.ConsumableShares): true,
-		}))
-
-		state := &DeviceState{
-			config: &Config{
-				flags: &Flags{
-					consumableShares: "unlimited",
+// newTestMpsDeviceState returns a DeviceState with an MPS manager backed by a
+// fake clientset and a temporary plugin directory. It runs no nvidia-smi as
+// long as only MIG devices are used.
+func newTestMpsDeviceState(t *testing.T) *DeviceState {
+	cfg := &Config{
+		flags: &Flags{
+			nodeName:                    "node-a",
+			namespace:                   "dra-driver",
+			consumableShares:            "4",
+			kubeletPluginsDirectoryPath: t.TempDir(),
+		},
+		clientsets: pkgflags.ClientSets{Core: k8sfake.NewSimpleClientset()},
+	}
+	return &DeviceState{
+		config:     cfg,
+		mpsManager: NewMpsManager(cfg, &deviceLib{}, "/", MpsControlDaemonTemplatePath),
+		perGPUAllocatable: &PerGPUAllocatableDevices{
+			allocatablesMap: map[PCIBusID]AllocatableDevices{
+				"0000:00:00.0": {
+					"mig-0": &AllocatableDevice{MigStatic: &MigDeviceInfo{UUID: "MIG-0"}},
 				},
 			},
-			perGPUAllocatable: perGPU,
-		}
+		},
+	}
+}
 
-		_, err := state.applySharingConfig(context.Background(), config, claim, results, nil)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "MPS sharing is not supported when consumable shares is enabled")
-	})
+// startTestMpsControlDaemon creates the Deployment and host directory that
+// Stop() tears down.
+func startTestMpsControlDaemon(t *testing.T, s *DeviceState, id string) {
+	daemon := s.mpsManager.NewMpsControlDaemon(id, AllocatableDevices{})
+	require.NoError(t, os.MkdirAll(daemon.shmDir, 0o755))
+	_, err := s.config.clientsets.Core.AppsV1().Deployments(daemon.namespace).Create(
+		context.Background(), newTestMpsDeployment(daemon.namespace, daemon.name, "node-a"), metav1.CreateOptions{})
+	require.NoError(t, err)
+}
 
-	t.Run("allowed when consumable shares disabled", func(t *testing.T) {
-		require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{
-			string(featuregates.MPSSupport):       true,
-			string(featuregates.ConsumableShares): false,
-		}))
+func isTestMpsControlDaemonRunning(t *testing.T, s *DeviceState, id string) bool {
+	daemon := s.mpsManager.NewMpsControlDaemon(id, AllocatableDevices{})
+	_, err := s.config.clientsets.Core.AppsV1().Deployments(daemon.namespace).Get(context.Background(), daemon.name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		_, statErr := os.Stat(daemon.rootDir)
+		require.True(t, os.IsNotExist(statErr), "host directory must be removed with the daemon")
+		return false
+	}
+	require.NoError(t, err)
+	return true
+}
 
-		cfg := &Config{
-			flags: &Flags{
-				nodeName:         "node-a",
-				namespace:        "default",
-				consumableShares: "disabled",
-			},
-		}
-		state := &DeviceState{
-			config:            cfg,
-			mpsManager:        NewMpsManager(cfg, nil, "/", "/templates/mps-control-daemon.tmpl.yaml"),
-			perGPUAllocatable: perGPU,
-		}
+func TestUnprepareDevicesSharedMpsControlDaemon(t *testing.T) {
+	setMpsWithConsumableSharesGates(t)
 
-		// Verify that applySharingConfig passes the consumable shares check (and reaches MPS daemon start)
-		defer func() {
-			r := recover()
-			// Panic happens on uninitialized clientset inside Start(), which proves it passed consumable shares check
-			if r == nil {
-				t.Log("applySharingConfig completed without panic")
+	testCases := map[string]struct {
+		otherClaim      *PreparedClaim
+		storedDaemonID  bool
+		expectedRunning bool
+	}{
+		"last claim on the device stops the daemon": {
+			storedDaemonID:  true,
+			expectedRunning: false,
+		},
+		"daemon keeps running while another claim uses the device": {
+			otherClaim:      ptr.To(newTestMigClaim("MIG-0", "mig-0", "", ClaimCheckpointStatePrepareCompleted)),
+			storedDaemonID:  true,
+			expectedRunning: true,
+		},
+		"partially prepared claim on the device does not keep the daemon": {
+			otherClaim:      ptr.To(newTestMigClaim("MIG-0", "mig-0", "", ClaimCheckpointStatePrepareStarted)),
+			storedDaemonID:  true,
+			expectedRunning: false,
+		},
+		"group without MPS cannot stop the shared daemon": {
+			storedDaemonID:  false,
+			expectedRunning: true,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			s := newTestMpsDeviceState(t)
+			sharedID := s.mpsManager.SharedMpsControlDaemonID("MIG-0")
+			startTestMpsControlDaemon(t, s, sharedID)
+
+			storedID := ""
+			if tc.storedDaemonID {
+				storedID = sharedID
 			}
-		}()
+			claim := newTestMigClaim("MIG-0", "mig-0", storedID, ClaimCheckpointStatePrepareCompleted)
+			checkpoint := &Checkpoint{V2: &CheckpointV2{PreparedClaims: PreparedClaimsByUID{"claim-1": claim}}}
+			if tc.otherClaim != nil {
+				checkpoint.V2.PreparedClaims["claim-2"] = *tc.otherClaim
+			}
 
-		_, err := state.applySharingConfig(context.Background(), config, claim, results, nil)
-		if err != nil {
-			require.NotContains(t, err.Error(), "MPS sharing is not supported when consumable shares is enabled")
-		}
-	})
+			_, err := s.unprepareDevices(context.Background(), "claim-1", claim.PreparedDevices, checkpoint)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedRunning, isTestMpsControlDaemonRunning(t, s, sharedID))
+		})
+	}
+}
+
+func TestStopUnusedSharedMpsControlDaemons(t *testing.T) {
+	setMpsWithConsumableSharesGates(t)
+
+	testCases := map[string]struct {
+		sharing         string
+		otherClaim      *PreparedClaim
+		expectedRunning bool
+	}{
+		"daemon started by a failed prepare is stopped": {
+			sharing:         "MPS",
+			expectedRunning: false,
+		},
+		"daemon used by a prepared claim keeps running": {
+			sharing:         "MPS",
+			otherClaim:      ptr.To(newTestMigClaim("MIG-0", "mig-0", "", ClaimCheckpointStatePrepareCompleted)),
+			expectedRunning: true,
+		},
+		"claim without MPS leaves the daemon alone": {
+			expectedRunning: true,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			s := newTestMpsDeviceState(t)
+			sharedID := s.mpsManager.SharedMpsControlDaemonID("MIG-0")
+			startTestMpsControlDaemon(t, s, sharedID)
+
+			claim := PreparedClaim{
+				CheckpointState: ClaimCheckpointStatePrepareStarted,
+				Status: resourceapi.ResourceClaimStatus{
+					Allocation: &resourceapi.AllocationResult{
+						Devices: resourceapi.DeviceAllocationResult{
+							Results: []resourceapi.DeviceRequestAllocationResult{{Driver: DriverName, Request: "req-0", Device: "mig-0"}},
+							Config:  []resourceapi.DeviceAllocationConfiguration{newTestOpaqueConfig("MigDeviceConfig", tc.sharing, "req-0")},
+						},
+					},
+				},
+			}
+			checkpoint := &Checkpoint{V2: &CheckpointV2{PreparedClaims: PreparedClaimsByUID{"claim-1": claim}}}
+			if tc.otherClaim != nil {
+				checkpoint.V2.PreparedClaims["claim-2"] = *tc.otherClaim
+			}
+
+			require.NoError(t, s.stopUnusedSharedMpsControlDaemons(context.Background(), "claim-1", claim, checkpoint))
+			require.Equal(t, tc.expectedRunning, isTestMpsControlDaemonRunning(t, s, sharedID))
+		})
+	}
 }
 
 func TestSharingReferenceCountingHelpers(t *testing.T) {
