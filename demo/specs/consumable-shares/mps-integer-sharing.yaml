@@ -1,0 +1,69 @@
+# Example demonstrating MPS with an integer share count (requires --consumable-shares=4
+# and featureGates.MPSSupport=true).
+# Each replica's claim consumes 1 of 4 shares and 4Gi of memory, which the driver
+# applies as MPS client limits: 25% of the GPU's threads and 4096M of pinned memory.
+# All replicas on a GPU share that GPU's MPS control daemon.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-share-mps
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: gpu-share-mps
+  name: gpu-mps-1share
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          capacity:
+            requests:
+              shares: 1
+              memory: 4Gi
+      config:
+      - requests: ["gpu"]
+        opaque:
+          driver: gpu.nvidia.com
+          parameters:
+            apiVersion: resource.nvidia.com/v1beta1
+            kind: GpuConfig
+            sharing:
+              strategy: MPS
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: gpu-share-mps
+  name: mps-sharing
+  labels:
+    app: mps-sharing
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: mps-sharing
+  template:
+    metadata:
+      labels:
+        app: mps-sharing
+    spec:
+      resourceClaims:
+      - name: gpu
+        resourceClaimTemplateName: gpu-mps-1share
+      containers:
+      - name: ctr
+        image: ubuntu:22.04
+        command: ["bash", "-c"]
+        args: ["nvidia-smi -L; env | grep '^CUDA_MPS_' | sort; sleep 3600"]
+        resources:
+          claims:
+          - name: gpu
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"

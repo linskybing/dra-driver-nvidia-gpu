@@ -77,8 +77,8 @@ Drain ComputeDomain workload pods and delete existing `ComputeDomain` resources 
 |---|---|---|
 | `image.repository` | `registry.k8s.io/dra-driver-nvidia/dra-driver-nvidia-gpu` | Container image repository for all driver components. |
 | `image.tag` | `""` | Image tag. When empty, defaults to the chart `appVersion` with a `v` prefix (for example, `v{{< param driver_version >}}`). |
-| `image.pullPolicy` | `IfNotPresent` | Image pull policy for all driver containers and per-claim MPS daemon containers. |
-| `imagePullSecrets` | `[]` | Secrets for pulling images for driver pods and per-claim MPS daemon pods from private registries. |
+| `image.pullPolicy` | `IfNotPresent` | Image pull policy for all driver containers and MPS control daemon containers. |
+| `imagePullSecrets` | `[]` | Secrets for pulling images for driver pods and MPS control daemon pods from private registries. |
 
 ## Feature gates
 

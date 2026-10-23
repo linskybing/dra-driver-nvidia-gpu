@@ -60,6 +60,23 @@ To try it out, run the driver with `--consumable-shares=4` (or any positive inte
 kubectl apply -f integer-sharing.yaml
 ```
 
+### 4. MPS with a share count
+
+With `featureGates.MPSSupport=true` and `--consumable-shares=4`, claims that
+select the MPS sharing strategy get their consumed capacity applied as MPS
+client limits:
+- `shares` becomes `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` (consumed shares × 100 / `N`).
+- `memory` becomes `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT` for the device.
+- All claims on one GPU or MIG device share that device's MPS control daemon
+  (`mps-control-daemon-shared-<id>`), which is removed with the last claim.
+
+To try it out, run the driver with `--consumable-shares=4`, and apply:
+
+```bash
+kubectl apply -f mps-integer-sharing.yaml
+kubectl logs -n gpu-share-mps deployment/mps-sharing
+```
+
 ## Scaling Replicas
 
 Each demo manifest deploys a Kubernetes `Deployment` backed by a `ResourceClaimTemplate`. Whenever a new replica is created, Kubernetes automatically generates a unique `ResourceClaim` for that pod replica.

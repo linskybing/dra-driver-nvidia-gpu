@@ -11,6 +11,7 @@ It marks supported devices as multi-allocatable and publishes a capacity policy;
 
 Use consumable capacity when separate pods need independent claims but can safely co-locate on one device.
 This differs from time-slicing and MPS, where multiple containers reference an allocation with a driver-specific sharing configuration.
+To also limit what each claim uses on the GPU, combine consumable capacity with MPS, as described in [Apply capacity limits with MPS](#apply-capacity-limits-with-mps).
 
 ## Feature status
 
@@ -34,7 +35,6 @@ Refer to the [feature gates reference](../../reference/feature-gates.md) for all
   Refer to [Kubernetes consumable capacity](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/#consumable-capacity).
 - Use the `gpu.nvidia.com` or `mig.nvidia.com` DeviceClass.
   The driver's consumable-capacity implementation does not support VFIO passthrough devices.
-- Do not use an MPS configuration on claims that use a shared device.
 
 ## Enable consumable capacity
 
@@ -118,6 +118,62 @@ capacity:
     shares: 2
 ```
 
+## Apply capacity limits with MPS
+
+The capacity that a claim consumes is otherwise only scheduler accounting.
+When the `MPSSupport` feature gate is also enabled, a claim that selects the MPS sharing strategy gets its consumed capacity applied as MPS client limits:
+
+| Consumed capacity | MPS client limit |
+|---|---|
+| `memory` | `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT` for the device, in MiB. |
+| `shares` | `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`, computed as consumed shares × 100 / `consumableShares`, rounded down, and at least 1. |
+
+A claim that consumes none of a capacity gets no limit for it, so the settings in its `mpsConfig` apply.
+For example, with `consumableShares=4`, each pod that uses this template can use 25% of the GPU's threads and 4096 MiB of pinned device memory:
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: gpu-mps-quarter
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          capacity:
+            requests:
+              shares: 1
+              memory: 4Gi
+      config:
+      - requests: ["gpu"]
+        opaque:
+          driver: gpu.nvidia.com
+          parameters:
+            apiVersion: resource.nvidia.com/v1beta1
+            kind: GpuConfig
+            sharing:
+              strategy: MPS
+```
+
+The driver runs one MPS control daemon per shared GPU or MIG device, a Deployment named `mps-control-daemon-shared-<id>`.
+All claims on that device use it, and the driver removes it when the last of them is released.
+
+Keep these constraints in mind:
+
+- **One MPS device per claim.**
+  A CUDA process can connect to only one MPS control daemon, so the driver rejects a claim with more than one MPS device in this mode.
+  Use one such claim per container.
+- **One `mpsConfig` per device.**
+  All claims on a device configure the same shared daemon, so their configurations must match.
+  The scheduler does not consider `mpsConfig`; a claim with a different configuration that is allocated a device in use fails to prepare.
+  Put the configuration in a dedicated `DeviceClass` so that its claims share it.
+- **Limits apply per process and are cooperative.**
+  MPS applies the limits to each CUDA process, so several processes in a claim's containers can together exceed them, and a process can unset the variables.
+  The `defaultActiveThreadPercentage` and `defaultPinnedDeviceMemoryLimit` settings of the shared daemon are the hard ceiling for all its clients, and they apply when they are lower than a claim's limits.
+
 ## Verify shared allocations
 
 Inspect the published device policy:
@@ -140,10 +196,10 @@ Example manifests for all three modes are available under [`demo/specs/consumabl
 ## Limitations and considerations
 
 - **Capacity is scheduling accounting, not runtime isolation.**
-  A memory value reserves scheduler-visible capacity but does not limit a process's CUDA memory use.
+  A memory value reserves scheduler-visible capacity but does not limit a process's CUDA memory use, unless the claim also uses MPS as described in [Apply capacity limits with MPS](#apply-capacity-limits-with-mps).
   Workloads sharing a device can affect each other's memory use and performance.
-- **MPS is not supported while the driver's consumable-capacity mode is active.**
-  The driver rejects an MPS-configured claim in this configuration.
+- **MPS claims are limited to one device.**
+  The driver rejects an MPS-configured claim with more than one MPS device, and claims on one device must use the same `mpsConfig`.
 - **VFIO passthrough is not supported.**
   The driver implements consumable capacity only for full GPUs and static or dynamic MIG devices.
 - **Claims must use matching device configurations.**

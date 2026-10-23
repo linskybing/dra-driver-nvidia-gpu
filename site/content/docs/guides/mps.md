@@ -67,6 +67,10 @@ plugin:
 
 One control daemon is created per unique set of devices in a claim, and it is
 removed when the claim is released.
+With [consumable capacity](./gpu-allocation/consumable-capacity.md#apply-capacity-limits-with-mps)
+enabled, the daemon belongs to the device instead: all claims on a GPU or MIG
+device share one daemon named `mps-control-daemon-shared-<id>`, which is removed
+when the last of them is released.
 
 {{% alert title="Note" %}}
 Because MPS sets the GPU compute mode to `EXCLUSIVE_PROCESS` and time-slicing
@@ -256,7 +260,7 @@ GPU.
 - MPS requires the
   `EXCLUSIVE_PROCESS` compute mode; time-slicing requires `DEFAULT`.
 - `MPSSupport` cannot be enabled together with `DynamicMIG`.
-- MPS claims cannot be prepared when `ConsumableShares` is enabled with a non-disabled `consumableShares` mode.
+- When `ConsumableShares` is enabled with a non-disabled `consumableShares` mode, an MPS claim can use only one device, and all claims on a device must use the same `mpsConfig`.
 - Setting `multiUser: true`
   requires GPUs of Volta architecture or newer; otherwise the claim fails to
   prepare.

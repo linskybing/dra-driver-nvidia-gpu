@@ -92,7 +92,7 @@ Optional sharing has separate gates and constraints:
 
 - `ConsumableShares` makes supported GPU or MIG devices multi-allocatable and lets Kubernetes account across independent claims.
 - `TimeSlicingSettings` applies CUDA time-slice settings to full GPUs.
-- `MPSSupport` starts a claim-specific MPS control daemon and adds its container edits. It is incompatible with consumable shares and currently with dynamic MIG.
+- `MPSSupport` starts an MPS control daemon and adds its container edits. The daemon is per claim, or per device and shared by all its claims under consumable shares, where each claim's consumed capacity becomes MPS client limits and a claim may have only one MPS device. It is currently incompatible with dynamic MIG.
 
 Verify the current constraints in `site/content/docs/reference/feature-gates.md` rather than assuming all sharing modes compose.
 

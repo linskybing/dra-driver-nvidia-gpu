@@ -100,8 +100,9 @@ const (
 	// ConsumableShares enables publishing consumable capacity and multi-allocation
 	// (AllowMultipleAllocations) support for devices in ResourceSlices, allowing
 	// multiple ResourceClaims to share the same GPU or MIG device when configured
-	// via --consumable-shares. Note: MPS sharing is not supported when consumable
-	// shares is enabled.
+	// via --consumable-shares. With MPSSupport, all claims on a device share one
+	// MPS control daemon, and each claim's consumed capacity becomes its MPS
+	// client limits.
 	ConsumableShares featuregate.Feature = "ConsumableShares"
 )
 
